@@ -93,14 +93,36 @@ class MarketplaceMonitor:
                 continue
 
     def _launch_browser(self: "MarketplaceMonitor") -> Browser:
-        """Launch a browser, preferring Chromium if available, otherwise any installed browser."""
-        # Try browsers in order of preference
+        """Launch a persistent browser so cookies/sessions survive restarts."""
+        user_data_dir = amm_home / "browser_data"
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if self.logger:
+                self.logger.debug("Attempting to launch persistent chromium browser...")
+            context = self.playwright.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir),
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            # launch_persistent_context returns a BrowserContext, get the browser from it
+            browser = context.browser
+            if self.logger:
+                self.logger.info(
+                    f"""{hilight("[Browser]", "info")} Successfully launched persistent chromium browser.""",
+                    extra=aimm_event("browser_ready", engine="chromium"),
+                )
+            return browser
+        except Exception as e:
+            if self.logger:
+                self.logger.debug(f"Failed to launch persistent chromium: {e}")
+
+        # Fallback: try regular launch
         browser_types = [
             ("chromium", self.playwright.chromium),
             ("firefox", self.playwright.firefox),
             ("webkit", self.playwright.webkit),
         ]
-
         for browser_name, browser_type in browser_types:
             try:
                 if self.logger:
@@ -117,7 +139,6 @@ class MarketplaceMonitor:
                     self.logger.debug(f"Failed to launch {browser_name}: {e}")
                 continue
 
-        # If all fail, raise an error
         raise RuntimeError(
             "No browser could be launched. Please ensure Chromium, Firefox, or WebKit is installed."
         )

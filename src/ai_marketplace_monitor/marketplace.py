@@ -513,13 +513,19 @@ class Marketplace(Generic[TMarketplaceConfig, TItemConfig]):
             self.page = None
 
         if self.page is None:
-            context = self.browser.new_context(
-                proxy=(
-                    None
-                    if self.config.monitor_config is None
-                    else self.config.monitor_config.get_proxy_options()
+            # Reuse existing persistent context if available (from launch_persistent_context),
+            # otherwise create a new context
+            contexts = self.browser.contexts
+            if contexts:
+                context = contexts[0]
+            else:
+                context = self.browser.new_context(
+                    proxy=(
+                        None
+                        if self.config.monitor_config is None
+                        else self.config.monitor_config.get_proxy_options()
+                    )
                 )
-            )
             self.page = context.new_page()
         return self.page
 

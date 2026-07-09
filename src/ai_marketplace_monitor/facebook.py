@@ -283,7 +283,16 @@ class FacebookMarketplace(Marketplace):
 
         self.page = self.create_page(swap_proxy=True)
 
-        # Navigate to the URL, no timeout
+        # First, check if already logged in by visiting Marketplace directly
+        self.goto_url("https://www.facebook.com/marketplace/")
+        if "login" not in self.page.url:
+            if self.logger:
+                self.logger.info(
+                    f"""{hilight("[Login]", "succ")} Already logged in — session reused from persistent browser."""
+                )
+            return
+
+        # Not logged in — go to login page
         self.goto_url(self.initial_url)
 
         if self.logger:
@@ -487,9 +496,9 @@ class FacebookMarketplace(Marketplace):
                     self.page, self.translator, self.logger
                 ).get_listings()
                 time.sleep(5)
-                if self.logger:
-                    self.logger.error(
-                        f"""{hilight("[Search]", "fail")} Failed to get search results for {search_phrase} from {city}"""
+                if not found_listings and self.logger:
+                    self.logger.warning(
+                        f"""{hilight("[Search]", "fail")} No listings found for {search_phrase} from {city}"""
                     )
 
                 counter.increment(CounterItem.SEARCH_PERFORMED, item_config.name)
@@ -713,65 +722,90 @@ class FacebookSearchResultPage(WebPage):
                 self.logger.info(f"{hilight('[Retrieve]', 'dim')} {msg}")
             return []
 
-        # find the grid box
-        try:
-            valid_listings = (
-                self._get_listing_elements_by_traversing_header()
-                or self._get_listings_elements_by_children_counts()
-            )
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            filename = datetime.datetime.now().strftime("debug_%Y%m%d_%H%M%S.html")
-            if self.logger:
-                self.logger.error(
-                    f"{hilight('[Retrieve]', 'fail')} failed to parse searching result. Page saved to {filename}: {e}"
-                )
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(self.page.content())
-            return []
-
+        # Use anchor elements directly — more robust than DOM traversal
         listings: List[Listing] = []
-        for idx, listing in enumerate(valid_listings):
+        seen_ids: set[str] = set()
+
+        anchors = self.page.locator('a[href*="/marketplace/item/"]').all()
+        for a in anchors:
             try:
-                atag = listing.query_selector(
-                    ":scope > :first-child > :first-child > :first-child > :first-child > :first-child > :first-child > :first-child > :first-child"
-                )
-                if not atag:
+                href = a.get_attribute("href") or ""
+                if not href:
                     continue
-                post_url = atag.get_attribute("href") or ""
-                details_divs = atag.query_selector_all(":scope > :first-child > div")
-                if not details_divs:
+
+                # Extract item ID from URL
+                import re
+                m = re.search(r"/marketplace/item/(\d+)", href)
+                if not m:
                     continue
-                details = details_divs[1]
-                divs = details.query_selector_all(":scope > div")
-                raw_price = "" if len(divs) < 1 else divs[0].text_content() or ""
-                title = "" if len(divs) < 2 else divs[1].text_content() or ""
-                # location can be empty in some rare cases
-                location = "" if len(divs) < 3 else (divs[2].text_content() or "")
+                item_id = m.group(1)
+                if item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
 
-                # get image
-                img = listing.query_selector("img")
-                image = img.get_attribute("src") if img else ""
-                price = extract_price(raw_price)
+                post_url = f"https://www.facebook.com/marketplace/item/{item_id}/"
 
-                if post_url.startswith("/"):
-                    post_url = f"https://www.facebook.com{post_url}"
+                # Parse aria-label for structured data
+                aria_label = a.get_attribute("aria-label") or ""
+                title = ""
+                price_str = ""
+                location = ""
 
-                if image.startswith("/"):
-                    image = f"https://www.facebook.com{image}"
+                if aria_label:
+                    # Format: "Title, $Price, Location, listing NNN"
+                    parts = [p.strip() for p in aria_label.split(",")]
+                    if len(parts) >= 3:
+                        # Find price part
+                        for i, p in enumerate(parts):
+                            if "$" in p or p.lower() == "free":
+                                price_str = p
+                                title = ", ".join(parts[:i])
+                                # Location is after price, before "listing NNN"
+                                loc_parts = []
+                                for lp in parts[i+1:]:
+                                    if lp.lower().startswith("listing "):
+                                        break
+                                    loc_parts.append(lp)
+                                location = ", ".join(loc_parts)
+                                break
+
+                # Fallback: parse from inner text
+                if not title:
+                    text = a.inner_text().strip()
+                    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+                    if lines:
+                        # First line with $ is price
+                        price_idx = -1
+                        for i, ln in enumerate(lines):
+                            if "$" in ln:
+                                price_idx = i
+                                price_str = ln
+                                break
+                        if price_idx >= 0:
+                            title_lines = [l for l in lines[price_idx+1:] if l != price_str and not l.startswith("$")]
+                            if title_lines:
+                                title = title_lines[0]
+                            if len(title_lines) > 1:
+                                location = title_lines[-1]
+
+                price = extract_price(price_str)
+
+                # Get image
+                img = a.locator("img").first
+                image = ""
+                try:
+                    image = img.get_attribute("src") or ""
+                except Exception:
+                    pass
 
                 listings.append(
                     Listing(
                         marketplace="facebook",
                         name="",
-                        id=post_url.split("?")[0].rstrip("/").split("/")[-1],
+                        id=item_id,
                         title=title,
                         image=image,
                         price=price,
-                        # all the ?referral_code&referral_sotry_type etc
-                        # could be helpful for live navigation, but will be stripped
-                        # for caching item details.
                         post_url=post_url,
                         location=location,
                         condition="",
@@ -784,9 +818,10 @@ class FacebookSearchResultPage(WebPage):
             except Exception as e:
                 if self.logger:
                     self.logger.error(
-                        f"{hilight('[Retrieve]', 'fail')} Failed to parse search results {idx + 1} listing: {e}"
+                        f"{hilight('[Retrieve]', 'fail')} Failed to parse listing: {e}"
                     )
                 continue
+
         return listings
 
 
@@ -816,22 +851,8 @@ class FacebookItemPage(WebPage):
         raise NotImplementedError("get_condition is not implemented for this page")
 
     def _expand_see_more(self: "FacebookItemPage") -> None:
-        """Click any 'See more' disclosure links to expand truncated descriptions."""
-        try:
-            see_more_buttons = self.page.locator(
-                f'div[role="button"]:has(span:text("{self.translator("See more")}"))'
-            )
-            # wait briefly for "See more" buttons to appear in the DOM
-            see_more_buttons.first.wait_for(state="visible", timeout=8000)
-            for i in range(see_more_buttons.count()):
-                see_more_buttons.nth(i).click(timeout=2000)
-            # allow the DOM to update after clicking
-            self.page.wait_for_timeout(500)
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            if self.logger:
-                self.logger.debug(f"{hilight('[Retrieve]', 'fail')} See more expansion: {e}")
+        """No-op: FB no longer uses 'See more' buttons."""
+        pass
 
     def parse(self: "FacebookItemPage", post_url: str) -> Listing:
         if not self.verify_layout():
@@ -873,9 +894,10 @@ class FacebookItemPage(WebPage):
 
 class FacebookRegularItemPage(FacebookItemPage):
     def verify_layout(self: "FacebookRegularItemPage") -> bool:
+        # FB now puts "Condition" in <span> elements, not <li>
         return any(
             self.translator("Condition") in (x.text_content() or "")
-            for x in self.page.query_selector_all("li")
+            for x in self.page.query_selector_all("span")
         )
 
     def get_title(self: "FacebookRegularItemPage") -> str:
@@ -913,15 +935,16 @@ class FacebookRegularItemPage(FacebookItemPage):
 
     def get_seller(self: "FacebookRegularItemPage") -> str:
         try:
+            # Try marketplace profile link first
             seller_locator = self.page.locator("//a[contains(@href, '/marketplace/profile')]")
             if seller_locator.count() == 0:
-                # Try an alternative pattern — Facebook sometimes uses
-                # different link structures for the seller name.
+                # Try general profile link
                 seller_locator = self.page.locator("//a[contains(@href, '/profile')]")
             if seller_locator.count() == 0:
+                # FB may show seller name in a span near "Seller details" text
+                seller_locator = self.page.locator("//span[contains(text(), 'Seller')]/ancestor::div[1]//span")
+            if seller_locator.count() == 0:
                 return self.translator("**unspecified**")
-            # Use a short timeout to avoid a 30s delay when seller data is not
-            # present (e.g. in anonymous/not-logged-in mode). See #289.
             return seller_locator.last.text_content(timeout=3000) or self.translator(
                 "**unspecified**"
             )
@@ -936,11 +959,40 @@ class FacebookRegularItemPage(FacebookItemPage):
 
     def get_description(self: "FacebookRegularItemPage") -> str:
         try:
-            # Find the span with text "condition", then parent, then next...
-            description_element = self.page.locator(
-                f'span:text("{self.translator("Condition")}") >> xpath=ancestor::ul[1] >> xpath=following-sibling::*[1]'
+            # Find the span with text "Condition", then find the description
+            # FB now uses spans/divs, not ul/li
+            condition_span = self.page.locator(
+                f'span:text("{self.translator("Condition")}")'
             )
-            return description_element.text_content() or self.translator("**unspecified**")
+            if condition_span.count() == 0:
+                return self.translator("**unspecified**")
+
+            # Walk up to find the container, then get following text
+            # Try multiple strategies
+            # Strategy 1: xpath following-sibling
+            desc_el = self.page.locator(
+                f'span:text("{self.translator("Condition")}") >> xpath=ancestor::*[3] >> xpath=following-sibling::*[1]'
+            )
+            if desc_el.count() > 0:
+                text = desc_el.first.text_content() or ""
+                if text.strip():
+                    return text
+
+            # Strategy 2: find all dir=auto divs and pick the longest non-title one
+            blocks = self.page.locator('[dir="auto"]').all_inner_texts()
+            blocks = [b.strip() for b in blocks if b.strip() and len(b.strip()) > 20]
+            if blocks:
+                # Exclude title and price blocks
+                h1_text = ""
+                try:
+                    h1_text = self.page.query_selector_all("h1")[-1].text_content() or ""
+                except Exception:
+                    pass
+                candidates = [b for b in blocks if b != h1_text and "$" not in b[:20]]
+                if candidates:
+                    return max(candidates, key=len)[:2000]
+
+            return self.translator("**unspecified**")
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -952,21 +1004,23 @@ class FacebookRegularItemPage(FacebookItemPage):
         try:
             if self.logger:
                 self.logger.debug(f"{hilight('[Debug]', 'info')} Getting condition info...")
-            # Find the span with text "condition", then parent, then next...
             condition_text = self.translator("Condition")
 
-            # Use .first property to avoid strict mode violation when multiple elements match
-            # This handles cases where "Condition" appears in both the label and description text
+            # FB now uses spans, not li elements
             condition_locator = self.page.locator(f'span:text("{condition_text}")')
-            condition_element = condition_locator.first
+            if condition_locator.count() == 0:
+                return ""
 
-            result = self._parent_with_cond(
-                condition_element,
-                lambda x: len(x) >= 2
-                and self.translator("Condition") in (x[0].text_content() or ""),
-                1,
-            )
-            return result
+            # The condition value is typically in a sibling span or following text
+            # Try to find it near the "Condition" label
+            parent = condition_locator.first.locator("..")
+            parent_text = parent.text_content() or ""
+            # Remove the "Condition" label to get the value
+            value = parent_text.replace(condition_text, "").strip()
+            if value:
+                return value
+
+            return ""
         except KeyboardInterrupt:
             raise
         except Exception as e:

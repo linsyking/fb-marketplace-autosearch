@@ -387,10 +387,13 @@ class AnthropicBackend(AIBackend):
         if self.client is None:
             import anthropic  # type: ignore
 
-            self.client = anthropic.Anthropic(
-                api_key=self.config.api_key,
-                timeout=self.config.timeout,
-            )
+            kwargs: dict = {"api_key": self.config.api_key}
+            if self.config.timeout is not None:
+                kwargs["timeout"] = self.config.timeout
+            if self.config.base_url is not None:
+                kwargs["base_url"] = self.config.base_url
+
+            self.client = anthropic.Anthropic(**kwargs)
             if self.logger:
                 self.logger.info(f"""{hilight("[AI]", "name")} {self.config.name} connected.""")
 
